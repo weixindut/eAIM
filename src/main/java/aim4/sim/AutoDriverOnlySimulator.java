@@ -62,6 +62,10 @@ import aim4.map.SpawnPoint.SpawnSpec;
 import aim4.map.lane.Lane;
 import aim4.msg.i2v.I2VMessage;
 import aim4.msg.v2i.V2IMessage;
+import aim4.ns3commond.CreateNode;
+import aim4.ns3commond.DeleteNode;
+import aim4.ns3commond.RunToTimestep;
+import aim4.ns3commond.UpdatePosition;
 import aim4.vehicle.AutoVehicleSimView;
 import aim4.vehicle.BasicAutoVehicle;
 import aim4.vehicle.HumanDrivenVehicleSimView;
@@ -69,6 +73,21 @@ import aim4.vehicle.ProxyVehicleSimView;
 import aim4.vehicle.VehicleSpec;
 import aim4.vehicle.VinRegistry;
 import aim4.vehicle.VehicleSimView;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+//add by weixin 
+import java.net.Socket;
+import java.net.SocketException;
+import java.util.Random;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 
 /**
  * The autonomous drivers only simulator.
@@ -78,11 +97,14 @@ public class AutoDriverOnlySimulator implements Simulator {
   /////////////////////////////////
   // NESTED CLASSES
   /////////////////////////////////
-
+    private enum msgType {
+    t_V2IMsg,
+    t_I2VMsg,
+  };
   /**
    * The result of a simulation step.
    */
-  public static class AutoDriverOnlySimStepResult implements SimStepResult {
+  public static class AutoDriverOnlySimStepResult implements Simulator.SimStepResult {
 
     /** The VIN of the completed vehicles in this time step */
     List<Integer> completedVINs;
@@ -123,7 +145,10 @@ public class AutoDriverOnlySimulator implements Simulator {
   /** The total number of bits received by the completed vehicles */
   private int totalBitsReceivedByCompletedVehicles;
 
-
+  private Map<Integer,VehicleSimView> preStepVehicles;  /*add by weixin*/
+  private List<Integer> completedVINsrecord;
+  private Map<Integer,I2VMessage> NSAdapterI2VMsgMap;
+  private Map<Integer,V2IMessage> NSAdapterV2IMsgMap;
   /////////////////////////////////
   // CLASS CONSTRUCTORS
   /////////////////////////////////
@@ -136,7 +161,12 @@ public class AutoDriverOnlySimulator implements Simulator {
   public AutoDriverOnlySimulator(BasicMap basicMap) {
     this.basicMap = basicMap;
     this.vinToVehicles = new HashMap<Integer,VehicleSimView>();
-
+      
+    this.preStepVehicles = new HashMap<Integer,VehicleSimView>();/*add by weixin*/
+    this.completedVINsrecord = new LinkedList<Integer>();
+    this.NSAdapterI2VMsgMap = new HashMap<Integer,I2VMessage>();
+    this.NSAdapterV2IMsgMap = new HashMap<Integer,V2IMessage>();
+    
     currentTime = 0.0;
     numOfCompletedVehicles = 0;
     totalBitsTransmittedByCompletedVehicles = 0;
@@ -153,7 +183,8 @@ public class AutoDriverOnlySimulator implements Simulator {
    * {@inheritDoc}
    */
   @Override
-  public synchronized AutoDriverOnlySimStepResult step(double timeStep) {
+  public synchronized AutoDriverOnlySimulator.AutoDriverOnlySimStepResult step(double timeStep) {
+    System.err.printf("------------------%.2f start--------------------\n",this.getSimulationTime());//test by weixin
     if (Debug.PRINT_SIMULATOR_STAGE) {
       System.err.printf("--------------------------------------\n");
       System.err.printf("------SIM:spawnVehicles---------------\n");
@@ -174,7 +205,11 @@ public class AutoDriverOnlySimulator implements Simulator {
     if (Debug.PRINT_SIMULATOR_STAGE) {
       System.err.printf("------SIM:communication---------------\n");
     }
-    communication();
+        try {
+            communication(timeStep);
+        } catch (IOException ex) {
+            Logger.getLogger(AutoDriverOnlySimulator.class.getName()).log(Level.SEVERE, null, ex);
+        }
     if (Debug.PRINT_SIMULATOR_STAGE) {
       System.err.printf("------SIM:moveVehicles---------------\n");
     }
@@ -182,12 +217,21 @@ public class AutoDriverOnlySimulator implements Simulator {
     if (Debug.PRINT_SIMULATOR_STAGE) {
       System.err.printf("------SIM:cleanUpCompletedVehicles---------------\n");
     }
-    List<Integer> completedVINs = cleanUpCompletedVehicles();
+    
+    //List<Integer> completedVINs = cleanUpCompletedVehicles();//delete by weixin 
+    completedVINsrecord.clear();
+    completedVINsrecord.addAll(cleanUpCompletedVehicles());//change by weixin
+//add by weixin
+    System.err.printf("------------------%.2f end--------------------\n",this.getSimulationTime());//test by weixin 
+    preStepVehicles.clear();
+    preStepVehicles.putAll(vinToVehicles);
+//weixin add end   
     currentTime += timeStep;
     // debug
     checkClocks();
-
-    return new AutoDriverOnlySimStepResult(completedVINs);
+    //change by weixin
+    return new AutoDriverOnlySimulator.AutoDriverOnlySimStepResult(completedVINsrecord);
+    //return new AutoDriverOnlySimStepResult(completedVINs);
   }
 
   /////////////////////////////////
@@ -737,11 +781,174 @@ public class AutoDriverOnlySimulator implements Simulator {
   /**
    * Deliver the V2I and I2V messages.
    */
-  private void communication() {
-    deliverV2IMessages();
-    deliverI2VMessages();
+  private void communication(double timestep)
+           throws IOException
+  {
+
+      /*************** used for connect ns3******************
+            int nsport=3333;
+            String nsIP="127.0.0.1";
+             
+            Socket connNS3Socket= new Socket(nsIP,nsport);
+            deliverNewAddNodes(connNS3Socket);
+            deliverDeleteNodes(connNS3Socket);
+            deliverVehicleDistribution(connNS3Socket);
+            runOneNs3Step(connNS3Socket,(int)timestep);
+
+            connNS3Socket.close();
+            System.err.printf("finish sending packet to NS3");
+             ******************************************/
+            //deliverV2IMessages2(dos);
+            //deliverI2VMessages2(dos);
+            
+            deliverV2IMessages();
+            deliverI2VMessages();
+            
+             
+
 //    deliverV2VMessages();
   }
+  private void runOneNs3Step(Socket socket,int timestep)
+          throws IOException  
+  {
+      RunToTimestep rtt = new RunToTimestep((int)this.currentTime+timestep);
+      boolean status = rtt.sendtoNS3(socket);
+      while(status!=true)
+          {
+              status=rtt.sendtoNS3(socket);
+          }
+      System.err.printf("run one ns3 step success!\n");
+      
+  }
+  private void deliverNewAddNodes(Socket socket)
+          throws IOException  
+  {
+      Map<Integer,VehicleSimView> newAddVehicles= new HashMap<Integer,VehicleSimView>();
+      for(int vin:vinToVehicles.keySet())
+      {
+          if(!preStepVehicles.containsKey(vin))//vin is new added
+          {
+               newAddVehicles.put(vin, vinToVehicles.get(vin));
+          }
+      }
+      System.err.printf("-----------------start to print new added vehicles at %.2f-------------------\n",getSimulationTime());
+      
+      for(VehicleSimView av: newAddVehicles.values() )
+      {
+          System.err.printf("add vehicle %d\n",av.getVIN());
+          CreateNode newaddnode=new CreateNode((float)av.getPosition().getX(),(float)av.getPosition().getY(),av.getVIN());
+          boolean status=newaddnode.sendtoNS3(socket);
+          while(status!=true)
+          {
+              status=newaddnode.sendtoNS3(socket);
+          }
+          System.err.printf("add vehicle %d success!\n",av.getVIN());
+      }
+  }
+  private void deliverDeleteNodes(Socket socket)
+          throws IOException  
+  {
+      System.err.printf("-----------------start to print completed vehicles at %.2f-------------------\n",getSimulationTime());
+       List<Integer> CoVe=this.completedVINsrecord;
+       DeleteNode deletenodes = new DeleteNode(CoVe);
+       boolean status = deletenodes.sendtoNS3(socket);
+       while(status!=true)
+       {
+           status = deletenodes.sendtoNS3(socket);
+       }
+       for(int cv: CoVe )
+      {
+          System.err.printf("delete vehicle %dsuccess\n",cv);
+      }
+  }
+  private DataOutputStream deliverV2IMessages2(DataOutputStream dos)
+          throws IOException 
+  {
+        for(VehicleSimView vehicle : vinToVehicles.values()) {
+      // Start with V2I messages
+            if (vehicle instanceof AutoVehicleSimView) {
+                AutoVehicleSimView sender = (AutoVehicleSimView)vehicle;
+                Queue<V2IMessage> v2iOutbox = sender.getV2IOutbox();
+                while(!v2iOutbox.isEmpty()) {
+                    V2IMessage msg = v2iOutbox.poll();
+                    V2IManager receiver =
+                    (V2IManager)basicMap.getImRegistry().get(msg.getImId());
+
+                    int msgIdentifier =new Random().nextInt(100000);
+                    while(NSAdapterV2IMsgMap.keySet().contains(msgIdentifier))
+                    {
+                        msgIdentifier = new Random().nextInt(100000);
+                    }          
+                    NSAdapterV2IMsgMap.put(msgIdentifier, msg);
+              //如果收到来自ns3回应该消息已经收到，则删除该包；
+              //如果n久之后都没有回应，则超过一定时间界限就删除该包，需要进一步参考AIM内部消息处理代码
+                    AutoDriverOnlySimulator.msgType mt=AutoDriverOnlySimulator.msgType.t_V2IMsg;
+                    dos.writeInt(mt.ordinal());
+                    dos.writeInt(msgIdentifier);
+                    dos.writeInt(sender.getVIN());
+                    dos.writeInt(receiver.getId());
+          
+                }
+            }
+        }
+        return dos;
+  }
+  private DataOutputStream deliverI2VMessages2(DataOutputStream dos)
+          throws IOException 
+  {
+      for(IntersectionManager im : basicMap.getIntersectionManagers()) 
+      {
+            V2IManager senderIM = (V2IManager)im;
+            for(Iterator<I2VMessage> i2vIter = senderIM.outboxIterator();
+            i2vIter.hasNext();) 
+            {
+                I2VMessage msg = i2vIter.next();
+                AutoVehicleSimView vehicle =
+                (AutoVehicleSimView)VinRegistry.getVehicleFromVIN(
+                msg.getVin());
+                
+                int msgIdentifier =new Random().nextInt(100000);
+                while(NSAdapterI2VMsgMap.keySet().contains(msgIdentifier))
+                {
+                    msgIdentifier = new Random().nextInt(100000);
+                }          
+                NSAdapterI2VMsgMap.put(msgIdentifier, msg);
+              //如果收到来自ns3回应该消息已经收到，则删除该包；
+              //如果n久之后都没有回应，则超过一定时间界限就删除该包，需要进一步参考AIM内部消息处理代码
+                AutoDriverOnlySimulator.msgType mt=AutoDriverOnlySimulator.msgType.t_I2VMsg;
+                dos.writeInt(mt.ordinal());
+                dos.writeInt(msgIdentifier);
+                dos.writeInt(senderIM.getId());
+                dos.writeInt(vehicle.getVIN());
+            }
+      // Done delivering the IntersectionManager's messages, so clear the
+      // outbox.
+            senderIM.clearOutbox();
+       }
+        return dos;
+  }
+   /**
+   * Deliver Vehicle Distribution data to NS3.
+   * Author:weixin
+   */
+  private void deliverVehicleDistribution(Socket socket)
+       throws IOException   
+  {
+    
+      System.err.printf("-----------------start to print active vehicles at %.2f-------------------\n",getSimulationTime());
+      for(VehicleSimView vehicle : vinToVehicles.values())
+      {
+          Point2D location= vehicle.getPosition();
+          UpdatePosition updatenode = new UpdatePosition((float)vehicle.getPosition().getX(),(float)vehicle.getPosition().getY(),vehicle.getVIN());
+          boolean status = updatenode.sendtoNS3(socket);
+          while(status!=true)
+          {
+              status=updatenode.sendtoNS3(socket);
+          }
+          System.err.printf("update vehicle %d position success:X->%.2f\tY->%.2f\n",vehicle.getVIN(),location.getX(),location.getY());       
+      }
+  }
+   
 
   /**
    * Deliver the V2I messages.
@@ -755,8 +962,11 @@ public class AutoDriverOnlySimulator implements Simulator {
         Queue<V2IMessage> v2iOutbox = sender.getV2IOutbox();
         while(!v2iOutbox.isEmpty()) {
           V2IMessage msg = v2iOutbox.poll();
+          
+          
           V2IManager receiver =
             (V2IManager)basicMap.getImRegistry().get(msg.getImId());
+          
           // Calculate the distance the message must travel
           double txDistance =
             sender.getPosition().distance(
@@ -926,13 +1136,17 @@ public class AutoDriverOnlySimulator implements Simulator {
     List<Integer> completedVINs = new LinkedList<Integer>();
 
     Rectangle2D mapBoundary = basicMap.getDimensions();
-
+    
+    //System.err.printf("mapBoundary width %.2f\n",mapBoundary.getWidth());
+    //System.err.printf("mapBoundary Height %.2f\n",mapBoundary.getHeight());
+    
     List<Integer> removedVINs = new ArrayList<Integer>(vinToVehicles.size());
     for(int vin : vinToVehicles.keySet()) {
       VehicleSimView v = vinToVehicles.get(vin);
       // If the vehicle is no longer in the layout
       // TODO: this should be replaced with destination zone.
       if(!v.getShape().intersects(mapBoundary)) {
+          //System.err.printf("going to delete vehicle %d position is (%.2f,%.2f)\n",v.getVIN(),v.getPosition().getX(),v.getPosition().getY());
         // Process all the things we need to from this vehicle
         if (v instanceof AutoVehicleSimView) {
           AutoVehicleSimView v2 = (AutoVehicleSimView)v;
